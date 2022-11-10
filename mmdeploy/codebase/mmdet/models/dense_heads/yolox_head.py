@@ -225,3 +225,66 @@ def yolox_head__get_bboxes__ncnn(ctx,
         self.num_classes + 1,
         vars.cpu().detach().numpy())
     return output__ncnn
+
+
+@FUNCTION_REWRITER.register_rewriter(
+    func_name='mmdet.models.YOLOXHead_DT.get_bboxes')
+def yolox_dt_head__get_bboxes(ctx,
+                              self,
+                              cls_scores,
+                              bbox_preds,
+                              objectnesses,
+                              img_metas=None,
+                              cfg=None,
+                              rescale=False,
+                              with_nms=True):
+
+    @mark('yolo_head', inputs=['cls_scores', 'bbox_preds', 'objectnesses'])
+    def __mark_pred_maps(cls_scores, bbox_preds, objectnesses):
+        return cls_scores, bbox_preds, objectnesses
+
+    cls_scores, bbox_preds, objectnesses = __mark_pred_maps(
+        cls_scores, bbox_preds, objectnesses)
+    assert len(cls_scores) == len(bbox_preds) == len(objectnesses)
+    device = cls_scores[0].device
+    cfg = self.test_cfg if cfg is None else cfg
+    batch_size = bbox_preds[0].shape[0]
+    featmap_sizes = [cls_score.shape[2:] for cls_score in cls_scores]
+    mlvl_priors = self.prior_generator.grid_priors(
+        featmap_sizes, device=device, with_stride=True)
+
+    flatten_cls_scores = [
+        cls_score.permute(0, 2, 3, 1).reshape(batch_size, -1,
+                                              self.cls_out_channels)
+        for cls_score in cls_scores
+    ]
+    flatten_bbox_preds = [
+        bbox_pred.permute(0, 2, 3, 1).reshape(batch_size, -1, 4)
+        for bbox_pred in bbox_preds
+    ]
+    flatten_objectness = [
+        objectness.permute(0, 2, 3, 1).reshape(batch_size, -1)
+        for objectness in objectnesses
+    ]
+
+    cls_scores = torch.cat(flatten_cls_scores, dim=1).sigmoid()
+    score_factor = torch.cat(flatten_objectness, dim=1).sigmoid()
+    flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
+    flatten_priors = torch.cat(mlvl_priors)
+    bboxes = self._bbox_decode(flatten_priors, flatten_bbox_preds)
+    # directly multiply score factor and feed to nms
+    scores = cls_scores * (score_factor.unsqueeze(-1))
+
+    if not with_nms:
+        return bboxes, scores
+
+    deploy_cfg = ctx.cfg
+    post_params = get_post_processing_params(deploy_cfg)
+    max_output_boxes_per_class = post_params.max_output_boxes_per_class
+    iou_threshold = cfg.nms.get('iou_threshold', post_params.iou_threshold)
+    score_threshold = cfg.get('score_thr', post_params.score_threshold)
+    pre_top_k = post_params.pre_top_k
+    keep_top_k = cfg.get('max_per_img', post_params.keep_top_k)
+    return multiclass_nms(bboxes, scores, max_output_boxes_per_class,
+                          iou_threshold, score_threshold, pre_top_k,
+                          keep_top_k)

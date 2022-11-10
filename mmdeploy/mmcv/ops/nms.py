@@ -175,3 +175,45 @@ class TRTBatchedNMSop(torch.autograd.Function):
             clip_boxes_i=False,
             return_index_i=return_index,
             outputs=3 if return_index else 2)
+
+
+class ONNXNMS(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        boxes: Tensor,
+        scores: Tensor,
+        max_output_boxes_per_class: Tensor = torch.tensor([100]),
+        iou_threshold: Tensor = torch.tensor([0.5]),
+        score_threshold: Tensor = torch.tensor([0.05])
+    ) -> Tensor:
+        device = boxes.device
+        batch = scores.shape[0]
+        num_det = 20
+        batches = torch.randint(0, batch, (num_det, )).sort()[0].to(device)
+        idxs = torch.arange(100, 100 + num_det).to(device)
+        zeros = torch.zeros((num_det, ), dtype=torch.int64).to(device)
+        selected_indices = torch.cat([batches[None], zeros[None], idxs[None]],
+                                     0).T.contiguous()
+        selected_indices = selected_indices.to(torch.int64)
+
+        return selected_indices
+
+    @staticmethod
+    def symbolic(
+            g,
+            boxes: Tensor,
+            scores: Tensor,
+            max_output_boxes_per_class: Tensor = torch.tensor([100]),
+            iou_threshold: Tensor = torch.tensor([0.5]),
+            score_threshold: Tensor = torch.tensor([0.05]),
+    ):
+        return g.op(
+            'NonMaxSuppression',
+            boxes,
+            scores,
+            max_output_boxes_per_class,
+            iou_threshold,
+            score_threshold,
+            outputs=1)

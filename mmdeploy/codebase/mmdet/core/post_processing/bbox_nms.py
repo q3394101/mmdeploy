@@ -6,7 +6,7 @@ from packaging import version
 from torch import Tensor
 
 from mmdeploy.core import FUNCTION_REWRITER, mark
-from mmdeploy.mmcv.ops.nms import ONNXNMSop, TRTBatchedNMSop
+from mmdeploy.mmcv.ops.nms import ONNXNMS, ONNXNMSop, TRTBatchedNMSop
 from mmdeploy.utils import IR, is_dynamic_batch
 from mmdeploy.utils.constants import Backend
 
@@ -83,7 +83,8 @@ def _multiclass_nms(boxes: Tensor,
                     iou_threshold: float = 0.5,
                     score_threshold: float = 0.05,
                     pre_top_k: int = -1,
-                    keep_top_k: int = -1):
+                    keep_top_k: int = -1,
+                    box_coding: int = 0):
     """Create a dummy onnx::NonMaxSuppression op while exporting to ONNX.
 
     This function helps exporting to onnx with batch and multiclass NMS op. It
@@ -122,7 +123,8 @@ def _multiclass_nms_single(boxes: Tensor,
                            iou_threshold: float = 0.5,
                            score_threshold: float = 0.05,
                            pre_top_k: int = -1,
-                           keep_top_k: int = -1):
+                           keep_top_k: int = -1,
+                           box_coding: int = 0):
     """Create a dummy onnx::NonMaxSuppression op while exporting to ONNX.
 
     Single batch nms could be optimized.
@@ -171,6 +173,96 @@ def _multiclass_nms_single(boxes: Tensor,
     return dets, labels
 
 
+def _multiclass_nms_onnxb1(boxes: Tensor,
+                           scores: Tensor,
+                           max_output_boxes_per_class: int = 1000,
+                           iou_threshold: float = 0.5,
+                           score_threshold: float = 0.05,
+                           pre_top_k: int = -1,
+                           keep_top_k: int = -1,
+                           box_coding: int = 0):
+    """Create a dummy onnx::NonMaxSuppression op while exporting to ONNX.
+
+    Single batch nms could be optimized.
+    """
+    max_output_boxes_per_class = torch.LongTensor([max_output_boxes_per_class])
+    iou_threshold = torch.tensor([iou_threshold], dtype=torch.float32)
+    score_threshold = torch.tensor([score_threshold], dtype=torch.float32)
+
+    # pre topk
+    if pre_top_k > 0:
+        max_scores, _ = scores.max(-1)
+        _, topk_inds = max_scores.squeeze(0).topk(pre_top_k)
+        boxes = boxes[:, topk_inds, :]
+        scores = scores[:, topk_inds, :]
+
+    scores = scores.permute(0, 2, 1)
+    selected_indices = ONNXNMS.apply(boxes, scores, max_output_boxes_per_class,
+                                     iou_threshold, score_threshold)
+
+    cls_inds = selected_indices[:, 1]
+    box_inds = selected_indices[:, 2]
+
+    scores = scores[:, cls_inds, box_inds].unsqueeze(2)
+    boxes = boxes[:, box_inds, ...]
+    dets = torch.cat([boxes, scores], dim=2)
+    labels = cls_inds.unsqueeze(0)
+
+    # pad
+    dets = torch.cat((dets, dets.new_zeros((1, 1, 5))), 1)
+    labels = torch.cat((labels, labels.new_zeros((1, 1))), 1)
+
+    # topk or sort
+    is_use_topk = keep_top_k > 0 and \
+        (torch.onnx.is_in_onnx_export() or keep_top_k < dets.shape[1])
+    if is_use_topk:
+        _, topk_inds = dets[:, :, -1].topk(keep_top_k, dim=1)
+    else:
+        _, topk_inds = dets[:, :, -1].sort(dim=1, descending=True)
+    topk_inds = topk_inds.squeeze(0)
+    dets = dets[:, topk_inds, ...]
+    labels = labels[:, topk_inds, ...]
+
+    return dets, labels
+
+
+def _multiclass_nms_onnxbd(boxes: Tensor,
+                           scores: Tensor,
+                           max_output_boxes_per_class: int = 1000,
+                           iou_threshold: float = 0.5,
+                           score_threshold: float = 0.05,
+                           pre_top_k: int = -1,
+                           keep_top_k: int = -1,
+                           box_coding: int = 0):
+    """Create a dummy onnx::NonMaxSuppression op while exporting to ONNX.
+
+    This function helps exporting to onnx with batch and multiclass NMS op. It
+    only supports class-agnostic detection results. That is, the scores is of
+    shape (N, num_bboxes, num_classes) and the boxes is of shape (N, num_boxes,
+    4).
+    """
+    max_output_boxes_per_class = torch.LongTensor([max_output_boxes_per_class])
+    iou_threshold = torch.tensor([iou_threshold], dtype=torch.float32)
+    score_threshold = torch.tensor([score_threshold], dtype=torch.float32)
+    batch_size = scores.shape[0]
+
+    if pre_top_k > 0:
+        max_scores, _ = scores.max(-1)
+        _, topk_inds = max_scores.topk(pre_top_k)
+        batch_inds = torch.arange(batch_size).view(-1, 1).long()
+        boxes = boxes[batch_inds, topk_inds, :]
+        scores = scores[batch_inds, topk_inds, :]
+
+    scores = scores.permute(0, 2, 1)
+    selected_indices = ONNXNMS.apply(boxes, scores, max_output_boxes_per_class,
+                                     iou_threshold, score_threshold)
+
+    dets, labels = select_nms_index(
+        scores, boxes, selected_indices, batch_size, keep_top_k=keep_top_k)
+
+    return dets, labels
+
+
 @FUNCTION_REWRITER.register_rewriter(
     func_name='mmdeploy.codebase.mmdet.core.post_processing'
     '.bbox_nms._multiclass_nms')
@@ -181,7 +273,8 @@ def multiclass_nms__default(ctx,
                             iou_threshold: float = 0.5,
                             score_threshold: float = 0.05,
                             pre_top_k: int = -1,
-                            keep_top_k: int = -1):
+                            keep_top_k: int = -1,
+                            box_coding: int = 0):
     """Create a dummy onnx::NonMaxSuppression op while exporting to ONNX.
 
     This function helps exporting to onnx with batch and multiclass NMS op.
@@ -202,6 +295,9 @@ def multiclass_nms__default(ctx,
             Defaults to -1.
         keep_top_k (int): Number of top K boxes to keep after nms.
             Defaults to -1.
+        box_coding (int): Bounding boxes format for nms.
+            Defaults to 0 means [x, y, w, h].
+            Set to 1 means [x1, y1 ,x2, y2].
 
     Returns:
         tuple[Tensor, Tensor]: (dets, labels), `dets` of shape [N, num_det, 5]
@@ -209,24 +305,39 @@ def multiclass_nms__default(ctx,
     """
     deploy_cfg = ctx.cfg
     batch_size = boxes.size(0)
-    if not is_dynamic_batch(deploy_cfg) and batch_size == 1:
-        return _multiclass_nms_single(
+    no_customop = deploy_cfg.get('no_customop', False)
+    if no_customop:
+        if is_dynamic_batch(deploy_cfg):
+            forward = _multiclass_nms_onnxbd
+        elif batch_size == 1:
+            forward = _multiclass_nms_onnxb1
+        else:
+            forward = _multiclass_nms_onnxbd
+        return forward(
             boxes,
             scores,
             max_output_boxes_per_class=max_output_boxes_per_class,
             iou_threshold=iou_threshold,
             score_threshold=score_threshold,
             pre_top_k=pre_top_k,
-            keep_top_k=keep_top_k)
+            keep_top_k=keep_top_k,
+            box_coding=box_coding)
     else:
-        return ctx.origin_func(
+        if is_dynamic_batch(deploy_cfg):
+            forward = ctx.origin_func
+        elif batch_size == 1:
+            forward = _multiclass_nms_single
+        else:
+            forward = ctx.origin_func
+        return forward(
             boxes,
             scores,
             max_output_boxes_per_class=max_output_boxes_per_class,
             iou_threshold=iou_threshold,
             score_threshold=score_threshold,
             pre_top_k=pre_top_k,
-            keep_top_k=keep_top_k)
+            keep_top_k=keep_top_k,
+            box_coding=box_coding)
 
 
 @FUNCTION_REWRITER.register_rewriter(
@@ -240,7 +351,8 @@ def multiclass_nms_static(ctx,
                           iou_threshold: float = 0.5,
                           score_threshold: float = 0.05,
                           pre_top_k: int = -1,
-                          keep_top_k: int = -1):
+                          keep_top_k: int = -1,
+                          box_coding: int = 0):
     """Wrapper for `multiclass_nms` with TensorRT.
 
     Args:
@@ -257,18 +369,38 @@ def multiclass_nms_static(ctx,
             Defaults to -1.
         keep_top_k (int): Number of top K boxes to keep after nms.
             Defaults to -1.
+        box_coding (int): Bounding boxes format for nms.
+            Defaults to 0 means [x, y, w, h].
+            Set to 1 means [x1, y1 ,x2, y2].
 
     Returns:
         tuple[Tensor, Tensor]: (dets, labels), `dets` of shape [N, num_det, 5]
             and `labels` of shape [N, num_det].
     """
-    boxes = boxes if boxes.dim() == 4 else boxes.unsqueeze(2)
+    nms_method = ctx.cfg.get('nms_method', 0)
     keep_top_k = max_output_boxes_per_class if keep_top_k < 0 else min(
         max_output_boxes_per_class, keep_top_k)
-    dets, labels = TRTBatchedNMSop.apply(boxes, scores, int(scores.shape[-1]),
-                                         pre_top_k, keep_top_k, iou_threshold,
-                                         score_threshold, -1)
 
+    if nms_method == 0:
+        boxes = boxes if boxes.dim() == 4 else boxes.unsqueeze(2)
+        dets, labels = TRTBatchedNMSop.apply(boxes, scores,
+                                             int(scores.shape[-1]), pre_top_k,
+                                             keep_top_k, iou_threshold,
+                                             score_threshold, -1)
+    elif nms_method == 1:
+        _, det_boxes, det_scores, labels = TRTEfficientNMSop.apply(
+            boxes, scores, -1, box_coding, iou_threshold, keep_top_k, '1', 0,
+            score_threshold)
+        dets = torch.cat([det_boxes, det_scores.unsqueeze(2)], -1)
+    elif nms_method == 2:
+        boxes = boxes if boxes.dim() == 4 else boxes.unsqueeze(2)
+        _, _, numClasses = scores.shape
+        _, det_boxes, det_scores, labels = TRTbatchedNMSop.apply(
+            boxes, scores, '1', 1, -1, int(numClasses), min(pre_top_k, 4096),
+            keep_top_k, score_threshold, iou_threshold, 0, 0, 16, 1)
+        dets = torch.cat([det_boxes, det_scores.unsqueeze(2)], -1)
+    else:
+        raise NotImplementedError
     # retain shape info
     batch_size = boxes.size(0)
 
@@ -519,3 +651,123 @@ def multiclass_nms__ascend(ctx,
 
     dets = torch.cat([nmsed_boxes, nmsed_scores.unsqueeze(2)], dim=-1)
     return dets, nmsed_classes
+
+
+class TRTEfficientNMSop(torch.autograd.Function):
+
+    @staticmethod
+    def forward(
+        ctx,
+        boxes,
+        scores,
+        background_class=-1,
+        box_coding=0,
+        iou_threshold=0.45,
+        max_output_boxes=100,
+        plugin_version='1',
+        score_activation=0,
+        score_threshold=0.25,
+    ):
+        batch_size, _, num_classes = scores.shape
+        num_det = torch.randint(
+            0, max_output_boxes, (batch_size, 1), dtype=torch.int32)
+        det_boxes = torch.randn(batch_size, max_output_boxes, 4)
+        det_scores = torch.randn(batch_size, max_output_boxes)
+        det_classes = torch.randint(
+            0, num_classes, (batch_size, max_output_boxes), dtype=torch.int32)
+        return num_det, det_boxes, det_scores, det_classes
+
+    @staticmethod
+    def symbolic(g,
+                 boxes,
+                 scores,
+                 background_class=-1,
+                 box_coding=0,
+                 iou_threshold=0.45,
+                 max_output_boxes=100,
+                 plugin_version='1',
+                 score_activation=0,
+                 score_threshold=0.25):
+        out = g.op(
+            'TRT::EfficientNMS_TRT',
+            boxes,
+            scores,
+            background_class_i=background_class,
+            box_coding_i=box_coding,
+            iou_threshold_f=iou_threshold,
+            max_output_boxes_i=max_output_boxes,
+            plugin_version_s=plugin_version,
+            score_activation_i=score_activation,
+            score_threshold_f=score_threshold,
+            outputs=4)
+        nums, boxes, scores, classes = out
+        return nums, boxes, scores, classes
+
+
+class TRTbatchedNMSop(torch.autograd.Function):
+    """TensorRT NMS operation."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        boxes,
+        scores,
+        plugin_version='1',
+        shareLocation=1,
+        backgroundLabelId=-1,
+        numClasses=80,
+        topK=1000,
+        keepTopK=100,
+        scoreThreshold=0.25,
+        iouThreshold=0.45,
+        isNormalized=0,
+        clipBoxes=0,
+        scoreBits=16,
+        caffeSemantics=1,
+    ):
+        batch_size, _, numClasses = scores.shape
+        num_det = torch.randint(
+            0, keepTopK, (batch_size, 1), dtype=torch.int32)
+        det_boxes = torch.randn(batch_size, keepTopK, 4)
+        det_scores = torch.randn(batch_size, keepTopK)
+        det_classes = torch.randint(0, numClasses,
+                                    (batch_size, keepTopK)).float()
+        return num_det, det_boxes, det_scores, det_classes
+
+    @staticmethod
+    def symbolic(
+        g,
+        boxes,
+        scores,
+        plugin_version='1',
+        shareLocation=1,
+        backgroundLabelId=-1,
+        numClasses=80,
+        topK=1000,
+        keepTopK=100,
+        scoreThreshold=0.25,
+        iouThreshold=0.45,
+        isNormalized=0,
+        clipBoxes=0,
+        scoreBits=16,
+        caffeSemantics=1,
+    ):
+        out = g.op(
+            'TRT::BatchedNMSDynamic_TRT',
+            boxes,
+            scores,
+            shareLocation_i=shareLocation,
+            plugin_version_s=plugin_version,
+            backgroundLabelId_i=backgroundLabelId,
+            numClasses_i=numClasses,
+            topK_i=topK,
+            keepTopK_i=keepTopK,
+            scoreThreshold_f=scoreThreshold,
+            iouThreshold_f=iouThreshold,
+            isNormalized_i=isNormalized,
+            clipBoxes_i=clipBoxes,
+            scoreBits_i=scoreBits,
+            caffeSemantics_i=caffeSemantics,
+            outputs=4)
+        nums, boxes, scores, classes = out
+        return nums, boxes, scores, classes

@@ -163,6 +163,19 @@ def from_onnx(onnx_model: Union[str, onnx.ModelProto],
     # parse onnx
     parser = trt.OnnxParser(network, logger)
 
+    try:
+        from onnxsim import simplify
+    except ImportError:
+        pass
+    else:
+        if isinstance(onnx_model, str):
+            onnx_model = onnx.load(onnx_model)
+        elif isinstance(onnx_model, onnx.ModelProto):
+            onnx_model = onnx_model
+        else:
+            raise TypeError('Unsupported onnx model type!')
+        onnx_model, check = simplify(onnx_model)
+
     if isinstance(onnx_model, str):
         parse_valid = parser.parse_from_file(onnx_model)
     elif isinstance(onnx_model, onnx.ModelProto):
@@ -231,6 +244,7 @@ def from_onnx(onnx_model: Union[str, onnx.ModelProto],
             builder.int8_mode = int8_mode
             builder.int8_calibrator = config.int8_calibrator
 
+    config.profiling_verbosity = trt.ProfilingVerbosity.VERBOSE
     # create engine
     engine = builder.build_engine(network, config)
 
