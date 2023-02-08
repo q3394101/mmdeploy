@@ -243,6 +243,12 @@ def yolox_dt_head__get_bboxes(ctx,
     def __mark_pred_maps(cls_scores, bbox_preds, objectnesses):
         return cls_scores, bbox_preds, objectnesses
 
+    def _bbox_decode(priors, bbox_preds):
+        xys = (bbox_preds[..., :2] * priors[:, 2:]) + priors[:, :2]
+        whs = bbox_preds[..., 2:].exp() * priors[:, 2:]
+        decoded_bboxes = torch.cat([xys, whs], -1)
+        return decoded_bboxes
+
     cls_scores, bbox_preds, objectnesses = __mark_pred_maps(
         cls_scores, bbox_preds, objectnesses)
     assert len(cls_scores) == len(bbox_preds) == len(objectnesses)
@@ -271,7 +277,7 @@ def yolox_dt_head__get_bboxes(ctx,
     score_factor = torch.cat(flatten_objectness, dim=1).sigmoid()
     flatten_bbox_preds = torch.cat(flatten_bbox_preds, dim=1)
     flatten_priors = torch.cat(mlvl_priors)
-    bboxes = self._bbox_decode(flatten_priors, flatten_bbox_preds)
+    bboxes = _bbox_decode(flatten_priors, flatten_bbox_preds)
     # directly multiply score factor and feed to nms
     scores = cls_scores * (score_factor.unsqueeze(-1))
 
@@ -285,6 +291,12 @@ def yolox_dt_head__get_bboxes(ctx,
     score_threshold = cfg.get('score_thr', post_params.score_threshold)
     pre_top_k = post_params.pre_top_k
     keep_top_k = cfg.get('max_per_img', post_params.keep_top_k)
-    return multiclass_nms(bboxes, scores, max_output_boxes_per_class,
-                          iou_threshold, score_threshold, pre_top_k,
-                          keep_top_k)
+    return multiclass_nms(
+        bboxes,
+        scores,
+        max_output_boxes_per_class,
+        iou_threshold,
+        score_threshold,
+        pre_top_k,
+        keep_top_k,
+        box_coding=1)
