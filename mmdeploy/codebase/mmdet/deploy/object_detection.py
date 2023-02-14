@@ -101,6 +101,8 @@ class ObjectDetection(BaseTask):
 
         model = init_detector(self.model_cfg, model_checkpoint, self.device,
                               cfg_options)
+        if hasattr(model.backbone, 'switch_to_deploy'):
+            model.backbone.switch_to_deploy()
         return model.eval()
 
     def create_input(self,
