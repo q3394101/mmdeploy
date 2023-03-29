@@ -18,7 +18,7 @@ class CpuHostMemory : public NonCopyable {
 #elif defined(ANDROID)
     posix_memalign(&data_, alignment, space);
 #else
-    data_ = std::aligned_alloc(alignment, space);
+    data_ = aligned_alloc(alignment, space);
 #endif
     if (!data_) {
       return Status(eOutOfMemory);
@@ -69,6 +69,14 @@ class CpuHostMemory : public NonCopyable {
 
 ////////////////////////////////////////////////////////////////////////////////
 /// CpuPlatformImpl
+
+Result<void> CpuPlatformImpl::BindDevice(Device device, Device* prev) {
+  // do nothing
+  if (prev) {
+    *prev = device;
+  }
+  return success();
+}
 
 shared_ptr<BufferImpl> CpuPlatformImpl::CreateBuffer(Device device) {
   return std::make_shared<CpuBufferImpl>(device);
